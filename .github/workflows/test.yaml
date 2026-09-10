@@ -1,0 +1,58 @@
+# Unit tests, reusable from ci.yml. The tests need only a C++17 compiler and
+# Qt 6 Widgets, so they build standalone from tests/ without libobs. Ubuntu
+# uses the distro Qt, the same one the plugin links against there; macOS and
+# Windows use the pinned Qt bundle from obs-deps that the plugin ships with,
+# verified against the hash in buildspec.json.
+name: Test
+on:
+  workflow_call:
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build qt6-base-dev
+
+      - name: Fetch pinned Qt (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          version="$(jq -r '.dependencies.qt6.version' buildspec.json)"
+          hash="$(jq -r '.dependencies.qt6.hashes.macos' buildspec.json)"
+          curl -sSL -o qt.tar.xz "https://github.com/obsproject/obs-deps/releases/download/${version}/macos-deps-qt6-${version}-universal.tar.xz"
+          echo "${hash}  qt.tar.xz" | shasum -a 256 -c
+          mkdir qt && tar -xJf qt.tar.xz -C qt
+          xattr -r -d com.apple.quarantine qt || true
+          echo "CMAKE_PREFIX_PATH=${PWD}/qt" >> "$GITHUB_ENV"
+
+      - name: Fetch pinned Qt (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $spec = Get-Content buildspec.json -Raw | ConvertFrom-Json
+          $version = $spec.dependencies.qt6.version
+          $expected = $spec.dependencies.qt6.hashes.'windows-x64'
+          Invoke-WebRequest -Uri "https://github.com/obsproject/obs-deps/releases/download/$version/windows-deps-qt6-$version-x64.zip" -OutFile qt.zip
+          $actual = (Get-FileHash qt.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "Qt bundle hash mismatch: $actual" }
+          Expand-Archive qt.zip -DestinationPath qt
+          "CMAKE_PREFIX_PATH=$PWD\qt" >> $env:GITHUB_ENV
+
+      - name: Configure
+        run: cmake -S tests -B build_tests -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build_tests --config RelWithDebInfo
+
+      - name: Test
+        run: ctest --test-dir build_tests -C RelWithDebInfo --output-on-failure --no-tests=error
